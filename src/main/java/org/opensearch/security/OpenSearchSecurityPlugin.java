@@ -116,6 +116,8 @@ import org.opensearch.search.internal.SearchContext;
 import org.opensearch.search.query.QuerySearchResult;
 import org.opensearch.security.action.configupdate.ConfigUpdateAction;
 import org.opensearch.security.action.configupdate.TransportConfigUpdateAction;
+import org.opensearch.security.action.sslreload.SSLReloadAction;
+import org.opensearch.security.action.sslreload.TransportSSLReloadAction;
 import org.opensearch.security.action.whoami.TransportWhoAmIAction;
 import org.opensearch.security.action.whoami.WhoAmIAction;
 import org.opensearch.security.auditlog.AuditLog;
@@ -472,7 +474,7 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin 
                 handlers.add(new SecurityConfigUpdateAction(settings, restController,Objects.requireNonNull(threadPool), adminDns, configPath, principalExtractor));
                 handlers.add(new SecurityWhoAmIAction(settings ,restController,Objects.requireNonNull(threadPool), adminDns, configPath, principalExtractor));
                 if (sslCertReloadEnabled) {
-                    handlers.add(new SecuritySSLReloadCertsAction(settings, restController, sks, Objects.requireNonNull(threadPool), Objects.requireNonNull(adminDns)));
+                    handlers.add(new SecuritySSLReloadCertsAction(settings, restController, sks, Objects.requireNonNull(threadPool), Objects.requireNonNull(adminDns), nodesInCluster, GuiceHolder.getTransportService()));
                 }
                 final Collection<RestHandler> apiHandlers = SecurityRestApiActions.getHandler(settings, configPath, restController, localClient, adminDns, cr, cs, principalExtractor, evaluator, threadPool, Objects.requireNonNull(auditLog));
                 handlers.addAll(apiHandlers);
@@ -499,6 +501,9 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin 
         if(!disabled && !SSLConfig.isSslOnlyMode()) {
             actions.add(new ActionHandler<>(ConfigUpdateAction.INSTANCE, TransportConfigUpdateAction.class));
             actions.add(new ActionHandler<>(WhoAmIAction.INSTANCE, TransportWhoAmIAction.class));
+            if(sslCertReloadEnabled) {
+                actions.add(new ActionHandler(SSLReloadAction.INSTANCE, TransportSSLReloadAction.class));
+            }
         }
         return actions;
     }
@@ -1136,12 +1141,16 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin 
         private static RemoteClusterService remoteClusterService;
         private static IndicesService indicesService;
 
+        private static TransportService transportService;
+
+
         @Inject
         public GuiceHolder(final RepositoriesService repositoriesService,
-                final TransportService remoteClusterService, IndicesService indicesService) {
+                final TransportService transportService, IndicesService indicesService) {
             GuiceHolder.repositoriesService = repositoriesService;
-            GuiceHolder.remoteClusterService = remoteClusterService.getRemoteClusterService();
+            GuiceHolder.remoteClusterService = transportService.getRemoteClusterService();
             GuiceHolder.indicesService = indicesService;
+            GuiceHolder.transportService = transportService;
         }
 
         public static RepositoriesService getRepositoriesService() {
@@ -1155,7 +1164,11 @@ public final class OpenSearchSecurityPlugin extends OpenSearchSecuritySSLPlugin 
         public static IndicesService getIndicesService() {
             return indicesService;
         }
-        
+
+        public static TransportService getTransportService() {
+            return transportService;
+        }
+
         @Override
         public void close() {
         }

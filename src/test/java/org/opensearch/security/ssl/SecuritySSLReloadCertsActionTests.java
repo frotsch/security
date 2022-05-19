@@ -32,7 +32,12 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import org.opensearch.action.admin.cluster.health.ClusterHealthResponse;
+import org.opensearch.action.support.ActiveShardCount;
+import org.opensearch.cluster.health.ClusterHealthStatus;
+import org.opensearch.common.Priority;
 import org.opensearch.common.settings.Settings;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.security.ssl.util.SSLConfigConstants;
 import org.opensearch.security.support.ConfigConstants;
 import org.opensearch.security.test.DynamicSecurityConfig;
@@ -46,6 +51,8 @@ public class SecuritySSLReloadCertsActionTests extends SingleClusterTest {
     private final ClusterConfiguration clusterConfiguration = ClusterConfiguration.DEFAULT;
     private final String GET_CERT_DETAILS_ENDPOINT = "_opendistro/_security/api/ssl/certs";
     private final String RELOAD_TRANSPORT_CERTS_ENDPOINT = "_opendistro/_security/api/ssl/transport/reloadcerts";
+
+    private final String RELOAD_TRANSPORT_CERTS_ENDPOINT_DISCONNECT = RELOAD_TRANSPORT_CERTS_ENDPOINT+"?disconnectAfterReload=true";
     private final String RELOAD_HTTP_CERTS_ENDPOINT = "_opendistro/_security/api/ssl/http/reloadcerts";
     @Rule
     public TemporaryFolder testFolder = new TemporaryFolder();
@@ -224,6 +231,42 @@ public class SecuritySSLReloadCertsActionTests extends SingleClusterTest {
         assertReloadCertificateSuccess(rh, "http", getInitCertDetailsExpectedResponse());
     }
 
+    @Test
+    public void testReloadTransportSSLCertsPassDisconnect() throws Exception {
+        initClusterWithTestCerts();
+        RestHelper rh = getRestHelperAdminUser();
+        String certDetailsResponse = rh.executeSimpleRequest(GET_CERT_DETAILS_ENDPOINT);
+
+        JSONObject expectedJsonResponse = getInitCertDetailsExpectedResponse();
+        Assert.assertEquals(expectedJsonResponse.toString(), certDetailsResponse);
+
+        // Test Valid Case: Change transport file details to "ssl/pem/node-new.crt.pem" and "ssl/pem/node-new.key.pem"
+        updateFiles(newCertFilePath, pemCertFilePath);
+        updateFiles(newKeyFilePath, pemKeyFilePath);
+
+        assertReloadCertificateSuccess(rh, "transport", getUpdatedCertDetailsExpectedResponse("transport"), true);
+
+        //let the disconnects happen
+        Thread.sleep(1500);
+
+        final ClusterHealthResponse healthResponse = clusterHelper.nodeClient().admin().cluster().prepareHealth()
+                .setWaitForStatus(ClusterHealthStatus.GREEN)
+                .setTimeout(TimeValue.timeValueSeconds(60))
+                .setMasterNodeTimeout(TimeValue.timeValueSeconds(60))
+                .setWaitForNodes(String.valueOf(clusterConfiguration.getNodes()))
+                .setWaitForNoInitializingShards(true)
+                .setWaitForNoRelocatingShards(true)
+                .setWaitForActiveShards(ActiveShardCount.ALL)
+                .setWaitForEvents(Priority.LOW)
+                .execute()
+                .actionGet();
+
+        if (healthResponse.isTimedOut()) {
+            Assert.fail("cluster state is " + healthResponse.getStatus().name() + " with "
+                    + healthResponse.getNumberOfNodes() + " nodes");
+        }
+    }
+
     /**
      *
      * @param rh RestHelper to perform rest actions on the cluster
@@ -232,17 +275,27 @@ public class SecuritySSLReloadCertsActionTests extends SingleClusterTest {
      * @return True if all assertions pass
      * @throws Exception if rest api failed
      */
-    private void assertReloadCertificateSuccess(RestHelper rh, String updateChannel, JSONObject expectedCertResponse) throws Exception {
-        String reloadEndpoint = updateChannel.equals("http") ? RELOAD_HTTP_CERTS_ENDPOINT : RELOAD_TRANSPORT_CERTS_ENDPOINT;
+    private void assertReloadCertificateSuccess(RestHelper rh, String updateChannel, JSONObject expectedCertResponse, boolean disconnect) throws Exception {
+        String reloadEndpoint = updateChannel.equals("http") ? RELOAD_HTTP_CERTS_ENDPOINT : (disconnect ? RELOAD_TRANSPORT_CERTS_ENDPOINT_DISCONNECT: RELOAD_TRANSPORT_CERTS_ENDPOINT);
 
         RestHelper.HttpResponse reloadCertsResponse = rh.executePutRequest(reloadEndpoint, null);
         Assert.assertEquals(200, reloadCertsResponse.getStatusCode());
         JSONObject expectedJsonResponse = new JSONObject();
-        expectedJsonResponse.appendField("message", String.format("updated %s certs", updateChannel));
+        if(updateChannel.equals("transport") && disconnect) {
+            expectedJsonResponse.appendField("message", String.format("updated %s certs and disconnected", updateChannel));
+        } else {
+            expectedJsonResponse.appendField("message", String.format("updated %s certs", updateChannel));
+        }
+
         Assert.assertEquals(expectedJsonResponse.toString(), reloadCertsResponse.getBody());
 
         String certDetailsResponse = rh.executeSimpleRequest(GET_CERT_DETAILS_ENDPOINT);
         Assert.assertEquals(expectedCertResponse.toString(), certDetailsResponse);
+    }
+
+
+    private void assertReloadCertificateSuccess(RestHelper rh, String updateChannel, JSONObject expectedCertResponse) throws Exception {
+        assertReloadCertificateSuccess(rh, updateChannel, expectedCertResponse, false);
     }
 
     private void updateFiles(String srcFile, String dstFile) {

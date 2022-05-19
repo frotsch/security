@@ -18,8 +18,13 @@ package org.opensearch.security.ssl.rest;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
+import java.util.function.Supplier;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import org.opensearch.client.node.NodeClient;
+import org.opensearch.cluster.node.DiscoveryNodes;
 import org.opensearch.common.settings.Settings;
 import org.opensearch.common.util.concurrent.ThreadContext;
 import org.opensearch.common.xcontent.XContentBuilder;
@@ -28,12 +33,18 @@ import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestChannel;
 import org.opensearch.rest.RestController;
 import org.opensearch.rest.RestRequest;
+import org.opensearch.rest.RestResponse;
 import org.opensearch.rest.RestStatus;
+import org.opensearch.rest.action.RestResponseListener;
+import org.opensearch.security.action.sslreload.SSLReloadAction;
+import org.opensearch.security.action.sslreload.SSLReloadRequest;
+import org.opensearch.security.action.sslreload.SSLReloadResponse;
 import org.opensearch.security.configuration.AdminDNs;
 import org.opensearch.security.ssl.SecurityKeyStore;
 import org.opensearch.security.support.ConfigConstants;
 import org.opensearch.security.user.User;
 import org.opensearch.threadpool.ThreadPool;
+import org.opensearch.transport.TransportService;
 
 import static org.opensearch.rest.RestRequest.Method.PUT;
 
@@ -52,21 +63,28 @@ public class SecuritySSLReloadCertsAction extends BaseRestHandler {
             new Route(PUT, "_opendistro/_security/api/ssl/{certType}/reloadcerts/")
     );
 
+    protected Logger logger = LogManager.getLogger(getClass());
     private final Settings settings;
     private final SecurityKeyStore sks;
     private final ThreadContext threadContext;
     private final AdminDNs adminDns;
+    private final Supplier<DiscoveryNodes> nodesInCluster;
+    private final TransportService transportService;
 
     public SecuritySSLReloadCertsAction(final Settings settings,
                                         final RestController restController,
                                         final SecurityKeyStore sks,
                                         final ThreadPool threadPool,
-                                        final AdminDNs adminDns) {
+                                        final AdminDNs adminDns,
+                                        final Supplier<DiscoveryNodes> nodesInCluster,
+                                        final TransportService transportService) {
         super();
         this.settings = settings;
         this.sks = sks;
         this.adminDns = adminDns;
         this.threadContext = threadPool.getThreadContext();
+        this.nodesInCluster = nodesInCluster;
+        this.transportService = transportService;
     }
 
     @Override
@@ -96,55 +114,69 @@ public class SecuritySSLReloadCertsAction extends BaseRestHandler {
         return new RestChannelConsumer() {
 
             final String certType = request.param("certType").toLowerCase().trim();
+            final boolean disconnectAfterReload = request.paramAsBoolean("disconnectAfterReload", false);
 
             @Override
             public void accept(RestChannel channel) throws Exception {
-                XContentBuilder builder = channel.newBuilder();
                 BytesRestResponse response = null;
 
                 // Check for Super admin user
                 final User user = (User) threadContext.getTransient(ConfigConstants.OPENDISTRO_SECURITY_USER);
                 if(user ==null||!adminDns.isAdmin(user)) {
-                    response = new BytesRestResponse(RestStatus.FORBIDDEN, "");
+                    response = toJsonBytesRestResponse(channel,null, null, RestStatus.FORBIDDEN);
                 } else {
                     try {
-                        builder.startObject();
                         if (sks != null) {
                             switch (certType) {
                                 case "http":
                                     sks.initHttpSSLConfig();
-                                    builder.field("message", "updated http certs");
-                                    builder.endObject();
-                                    response = new BytesRestResponse(RestStatus.OK, builder);
+                                    response = toJsonBytesRestResponse(channel,"message", "updated http certs", RestStatus.OK);
                                     break;
                                 case "transport":
                                     sks.initTransportSSLConfig();
-                                    builder.field("message", "updated transport certs");
-                                    builder.endObject();
-                                    response = new BytesRestResponse(RestStatus.OK, builder);
+
+                                    if(disconnectAfterReload) {
+                                        final DiscoveryNodes nodes = nodesInCluster.get();
+
+                                        //disconnect must happen from both sides
+                                        //this node must disconnect from the other nodes
+                                        //the other nodes must also disconnect from this node
+                                        //after the connections are closed they will be automatically re-established
+
+                                        //make the other nodes disconnect from this node
+                                        client.execute(SSLReloadAction.INSTANCE, new SSLReloadRequest(transportService.getLocalNode().getId()), new RestResponseListener<SSLReloadResponse>(channel) {
+                                            @Override
+                                            public RestResponse buildResponse(SSLReloadResponse sslReloadResponse) throws Exception {
+
+                                                //this node now disconnects from every other node
+                                                nodes.forEach(n -> {
+                                                    try {
+                                                        transportService.disconnectFromNode(n);
+                                                    } catch (Exception e) {
+                                                        logger.error("Unable to disconnect from node {}", n.getId());
+                                                    }
+                                                });
+                                                logger.info("Disconnected from {} nodes because of reloading SSL certificates", nodes.getSize() - 1);
+                                                return toJsonBytesRestResponse(channel,"message", "updated transport certs and disconnected", RestStatus.OK);
+                                            }
+                                        });
+
+                                        return;
+                                    } else {
+                                        response = toJsonBytesRestResponse(channel,"message", "updated transport certs", RestStatus.OK);
+                                    }
+
                                     break;
                                 default:
-                                    builder.field("message", "invalid uri path, please use /_opendistro/_security/api/ssl/http/reload or " +
-                                        "/_opendistro/_security/api/ssl/transport/reload");
-                                    builder.endObject();
-                                    response = new BytesRestResponse(RestStatus.FORBIDDEN, builder);
+                                    response = toJsonBytesRestResponse(channel,"message", "invalid uri path, please use /_opendistro/_security/api/ssl/http/reload or " +
+                                            "/_opendistro/_security/api/ssl/transport/reload", RestStatus.FORBIDDEN);
                                     break;
                             }
                         } else {
-                            builder.field("message", "keystore is not initialized");
-                            builder.endObject();
-                            response = new BytesRestResponse(RestStatus.INTERNAL_SERVER_ERROR, builder);
+                            response = toJsonBytesRestResponse(channel,"message", "keystore is not initialized", RestStatus.INTERNAL_SERVER_ERROR);
                         }
                     } catch (final Exception e1) {
-                        builder = channel.newBuilder();
-                        builder.startObject();
-                        builder.field("error", e1.toString());
-                        builder.endObject();
-                        response = new BytesRestResponse(RestStatus.INTERNAL_SERVER_ERROR, builder);
-                    } finally {
-                        if (builder != null) {
-                            builder.close();
-                        }
+                        response = toJsonBytesRestResponse(channel,"error", e1.toString(), RestStatus.INTERNAL_SERVER_ERROR);
                     }
                 }
                 channel.sendResponse(response);
@@ -156,4 +188,16 @@ public class SecuritySSLReloadCertsAction extends BaseRestHandler {
     public String getName() {
         return "SSL Cert Reload Action";
     }
+
+    private static BytesRestResponse toJsonBytesRestResponse(RestChannel channel, String name, String value, RestStatus restStatus) throws IOException {
+        if(name == null || name.isEmpty()) {
+            return new BytesRestResponse(restStatus, "");
+        }
+
+        XContentBuilder builder = channel.newBuilder();
+        builder.startObject();
+        builder.field(name, value);
+        builder.endObject();
+        return new BytesRestResponse(restStatus, builder);
+    };
 }
